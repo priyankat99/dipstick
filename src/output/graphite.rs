@@ -5,17 +5,20 @@ use crate::input::InputKind;
 use crate::input::{Input, InputMetric, InputScope};
 use crate::metrics;
 use crate::name::MetricName;
-use crate::output::socket::RetrySocket;
+
 use crate::{CachedInput, QueuedInput};
 use crate::{Flush, MetricValue};
 
 use std::net::ToSocketAddrs;
 
+
+use std::net::UdpSocket;
+use std::sync::Arc;
 use std::fmt::Debug;
-use std::io::Write;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use std::sync::Arc;
+
 
 #[cfg(not(feature = "parking_lot"))]
 use std::sync::{RwLock, RwLockWriteGuard};
@@ -29,7 +32,7 @@ use std::io;
 #[derive(Clone, Debug)]
 pub struct Graphite {
     attributes: Attributes,
-    socket: Arc<RwLock<RetrySocket>>,
+    socket: Arc<UdpSocket>,
 }
 
 impl Input for Graphite {
@@ -46,9 +49,10 @@ impl Input for Graphite {
 
 impl Graphite {
     /// Send metrics to a graphite server at the address and port provided.
-    pub fn send_to<A: ToSocketAddrs + Debug + Clone>(address: A) -> io::Result<Graphite> {
-        debug!("Connecting to graphite {:?}", address);
-        let socket = Arc::new(RwLock::new(RetrySocket::new(address)?));
+    pub fn send_to<ADDR: ToSocketAddrs>(address: ADDR) -> io::Result<Graphite> {
+        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0")?);
+        socket.set_nonblocking(true)?;
+        socket.connect(address)?;
 
         Ok(Graphite {
             attributes: Attributes::default(),
@@ -73,7 +77,7 @@ impl Buffered for Graphite {}
 pub struct GraphiteScope {
     attributes: Attributes,
     buffer: Arc<RwLock<String>>,
-    socket: Arc<RwLock<RetrySocket>>,
+    socket: Arc<UdpSocket>,
 }
 
 impl InputScope for GraphiteScope {
@@ -141,26 +145,24 @@ impl GraphiteScope {
         }
     }
 
-    fn flush_inner(&self, mut buf: RwLockWriteGuard<String>) -> io::Result<()> {
-        if buf.is_empty() {
-            return Ok(());
+    fn flush_inner(&self, mut buffer: RwLockWriteGuard<String>) -> io::Result<()> {
+        if !buffer.is_empty() {
+            match self.socket.send(buffer.as_bytes()) {
+                Ok(size) => {
+                    metrics::GRAPHITE_SENT_BYTES.count(size);
+                    trace!("Sent {} bytes to graphite", buffer.len());
+                }
+                Err(e) => {
+                    metrics::GRAPHITE_SEND_ERR.mark();
+                    debug!("Failed to send buffer to graphite: {}", e);
+                    return Err(e)
+                }
+            };
+            buffer.clear();
         }
-
-        let mut sock = write_lock!(self.socket);
-        match sock.write_all(buf.as_bytes()) {
-            Ok(()) => {
-                metrics::GRAPHITE_SENT_BYTES.count(buf.len());
-                trace!("Sent {} bytes to graphite", buf.len());
-                buf.clear();
-                Ok(())
-            }
-            Err(e) => {
-                metrics::GRAPHITE_SEND_ERR.mark();
-                debug!("Failed to send buffer to graphite: {}", e);
-                Err(e)
-            }
-        }
+        Ok(())
     }
+
 }
 
 impl WithAttributes for GraphiteScope {
